@@ -116,29 +116,55 @@ async function fetchPRLinesChanged(env, number) {
   return (data.additions || 0) + (data.deletions || 0);
 }
 
-async function fetchRecentlyMergedPRs(env) {
-  const cutoff = Date.now() - DAY_MS;
-  const prs = await ghPaginate(env, `/repos/${env.TARGET_OWNER}/${env.TARGET_REPO}/pulls`, {
-    state: "closed",
-    sort: "updated",
-    direction: "desc",
-  });
-  return prs.filter((pr) => pr.merged_at && Date.parse(pr.merged_at) >= cutoff);
+// Uses the Search API (rather than paginating /pulls and filtering by date)
+// so this stays a small, bounded number of requests regardless of how much
+// closed-PR history the repo has - paginating and filtering client-side
+// means scanning the *entire* history every time, which blows through a
+// Worker's per-invocation subrequest limit on an active repo.
+async function ghSearchIssues(env, query) {
+  const results = [];
+  let page = 1;
+  while (true) {
+    const url = new URL(`${GITHUB_API}/search/issues`);
+    url.searchParams.set("q", query);
+    url.searchParams.set("per_page", "100");
+    url.searchParams.set("page", page);
+    const resp = await fetch(url, {
+      headers: {
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        Authorization: `Bearer ${env.GH_TOKEN}`,
+        "User-Agent": "physlib-bots-relay",
+      },
+    });
+    if (!resp.ok) {
+      const detail = await resp.text();
+      throw new Error(`GitHub search API error for ${url}: ${resp.status} ${detail}`);
+    }
+    const data = await resp.json();
+    results.push(...data.items);
+    if (data.items.length < 100) break;
+    page++;
+  }
+  return results;
 }
 
-async function fetchRecentlyOpenedPRs(env) {
-  const cutoff = Date.now() - DAY_MS;
-  const prs = await ghPaginate(env, `/repos/${env.TARGET_OWNER}/${env.TARGET_REPO}/pulls`, {
-    state: "all",
-    sort: "created",
-    direction: "desc",
-  });
-  const opened = [];
-  for (const pr of prs) {
-    if (Date.parse(pr.created_at) < cutoff) break;
-    opened.push(pr);
-  }
-  return opened;
+function isoCutoff() {
+  return new Date(Date.now() - DAY_MS).toISOString().slice(0, 19);
+}
+
+function fetchRecentlyMergedPRs(env) {
+  return ghSearchIssues(
+    env,
+    `repo:${env.TARGET_OWNER}/${env.TARGET_REPO} is:pr is:merged merged:>=${isoCutoff()}`
+  );
+}
+
+function fetchRecentlyOpenedPRs(env) {
+  return ghSearchIssues(
+    env,
+    `repo:${env.TARGET_OWNER}/${env.TARGET_REPO} is:pr created:>=${isoCutoff()}`
+  );
 }
 
 // Gets people who aren't assigned as a reviewer, but have pushed to the repo
