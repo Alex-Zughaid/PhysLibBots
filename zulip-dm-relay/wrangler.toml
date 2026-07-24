@@ -4,7 +4,7 @@ compatibility_date = "2026-07-23"
 
 # Not secret - fine as plain vars.
 [vars]
-TARGET_OWNER = "Alex-Zughaid"
+TARGET_OWNER = "leanprover-community"
 TARGET_REPO = "physlib"
 BUSY_THRESHOLD = "3"
 MAX_PRS_LISTED = "3"

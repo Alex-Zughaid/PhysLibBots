@@ -2,8 +2,9 @@
 
 Cloudflare Worker that, when the configured Zulip bot receives a direct
 message, builds a report of open PRs and reviewer load on
-[Alex-Zughaid/physlib](https://github.com/Alex-Zughaid/physlib) (via the
-GitHub API) and sends it back as a Zulip direct message to whoever asked.
+[leanprover-community/physlib](https://github.com/leanprover-community/physlib)
+(via the GitHub API) and sends it back as a Zulip direct message to whoever
+asked.
 
 GitHub Actions has no native "Zulip DM" trigger, and Zulip's outgoing webhook
 can't call arbitrary APIs directly with the right auth, so this Worker is the
@@ -14,10 +15,15 @@ workflow.
 ## Deploy
 
 1. Create a free Cloudflare account at https://dash.cloudflare.com/sign-up.
-2. Create a GitHub fine-grained personal access token with **read access to
-   `Alex-Zughaid/physlib`** (Contents: Read, Pull requests: Read; add
-   push/write access too if you want the collaborators list populated - see
-   the comment on `fetchCollaborators` in `src/index.js`).
+2. Create a GitHub fine-grained personal access token scoped to **"Public
+   Repositories (read-only)"** (since `leanprover-community/physlib` is
+   public and you're not a collaborator there, "selected repositories"
+   won't let you pick it - the public-read option covers any public repo).
+   Note the `/collaborators` endpoint used to build the reviewer roster
+   requires push access, which this token won't have, so that call will
+   fail gracefully and fall back to an empty collaborator list (see
+   `fetchCollaborators` in `src/index.js`) - the roster will only include
+   people with pending review requests, not the full collaborator list.
 3. From this directory:
    ```bash
    npx wrangler login
