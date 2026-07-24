@@ -1,14 +1,24 @@
-// Zulip DM -> reviewer/PR report, entirely in one Worker.
+// Zulip bot commands, entirely in one Worker.
 //
-// When the configured Zulip bot receives a direct message, this builds a
-// report of physlib's open PRs and reviewer load straight from the GitHub
-// API, then sends it back as a Zulip DM to whoever asked. No GitHub Actions
-// or repository_dispatch involved - this used to hand off to a workflow,
-// but since the Worker already has to talk to both APIs for the handshake,
-// it's simpler to just do the work here too.
+// Triggered either by DMing the bot, or by @-mentioning it in a stream
+// thread. In both cases Zulip's `data` field gives us the message content
+// with the bot's own mention stripped out, so we can treat "/reviews" the
+// same way regardless of where it came from. Replies go back as a DM for
+// the DM case, or into the same stream/topic for the mention case.
+//
+// Commands are a small lookup table (see COMMANDS below) so more can be
+// added later without restructuring the dispatch logic.
+//
+// No GitHub Actions or repository_dispatch involved - this used to hand
+// off to a workflow, but since the Worker already has to talk to both
+// APIs for the handshake, it's simpler to just do the work here too.
 
 const GITHUB_API = "https://api.github.com";
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+const COMMANDS = {
+  "/reviews": sendReviewReport,
+};
 
 export default {
   async fetch(request, env, ctx) {
@@ -30,36 +40,53 @@ export default {
       return new Response("Unauthorized", { status: 401 });
     }
 
-    // Only trigger on direct messages, not @-mentions in a stream.
-    if (payload.trigger !== "direct_message") {
+    // Only handle DMs and stream @-mentions - ignore anything else.
+    if (payload.trigger !== "direct_message" && payload.trigger !== "mention") {
       return jsonResponse({});
     }
 
-    const senderId = payload.message?.sender_id;
+    const command = (payload.data || "").trim();
+    const handler = COMMANDS[command];
+    if (!handler) {
+      return jsonResponse({});
+    }
+
+    const destination =
+      payload.trigger === "direct_message"
+        ? { type: "direct", userId: payload.message?.sender_id }
+        : {
+            type: "stream",
+            streamId: payload.message?.stream_id,
+            topic: payload.message?.subject ?? payload.message?.topic,
+          };
 
     // Building the report makes several sequential GitHub API calls, which
     // can take longer than Zulip's webhook timeout. Acknowledge immediately
     // and do the real work in the background, delivering the result as a
-    // separate DM once it's ready.
-    ctx.waitUntil(buildAndSendReport(env, senderId));
+    // follow-up message once it's ready.
+    ctx.waitUntil(runCommand(handler, env, destination));
 
-    return jsonResponse({ content: "One sec, building the report..." });
+    return jsonResponse({ content: "One sec, working on it..." });
   },
 };
 
-async function buildAndSendReport(env, senderId) {
+async function runCommand(handler, env, destination) {
   try {
-    const report = await buildReport(env);
-    const message = formatMessage(report);
-    await postToZulip(env, senderId, message);
+    await handler(env, destination);
   } catch (err) {
-    console.error("Failed to build/send report", err);
+    console.error("Command failed", err);
     await postToZulip(
       env,
-      senderId,
-      `Sorry, something went wrong generating the report: ${err.message}`
+      destination,
+      `Sorry, something went wrong: ${err.message}`
     ).catch(() => {});
   }
+}
+
+async function sendReviewReport(env, destination) {
+  const report = await buildReport(env);
+  const message = formatMessage(report);
+  await postToZulip(env, destination, message);
 }
 
 async function ghRequest(env, path, params) {
@@ -327,12 +354,17 @@ function formatMessage(report) {
   return lines.join("\n");
 }
 
-async function postToZulip(env, senderId, content) {
-  const body = new URLSearchParams({
-    type: "direct",
-    to: JSON.stringify([senderId]),
-    content,
-  });
+async function postToZulip(env, destination, content) {
+  const params =
+    destination.type === "direct"
+      ? { type: "direct", to: JSON.stringify([destination.userId]), content }
+      : {
+          type: "stream",
+          to: String(destination.streamId),
+          topic: destination.topic || "",
+          content,
+        };
+  const body = new URLSearchParams(params);
 
   const credentials = btoa(`${env.ZULIP_BOT_EMAIL}:${env.ZULIP_BOT_API_KEY}`);
 

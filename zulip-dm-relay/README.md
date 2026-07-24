@@ -1,16 +1,24 @@
-# Zulip DM relay
+# Zulip bot commands
 
-Cloudflare Worker that, when the configured Zulip bot receives a direct
-message, builds a report of open PRs and reviewer load on
-[leanprover-community/physlib](https://github.com/leanprover-community/physlib)
-(via the GitHub API) and sends it back as a Zulip direct message to whoever
-asked.
+Cloudflare Worker behind a Zulip bot that responds to commands - either DMed
+directly, or by @-mentioning the bot in a stream thread (e.g.
+`@**bot-name** /reviews`). Commands are a small lookup table in
+`src/index.js` (`COMMANDS`), currently just:
 
-GitHub Actions has no native "Zulip DM" trigger, and Zulip's outgoing webhook
-can't call arbitrary APIs directly with the right auth, so this Worker is the
-bridge - and since it already has to talk to both APIs for that handshake, it
-just does the report-building itself rather than handing off to a separate
-workflow.
+- `/reviews` - builds a report of open PRs and reviewer load on
+  [leanprover-community/physlib](https://github.com/leanprover-community/physlib)
+  (via the GitHub API) and sends it back. DMs get a DM reply; mentions in a
+  stream get a reply in that same stream/topic.
+
+GitHub Actions has no native "Zulip DM"/mention trigger, and Zulip's outgoing
+webhook can't call arbitrary APIs directly with the right auth, so this
+Worker is the bridge - and since it already has to talk to both APIs for
+that handshake, it just does the work itself rather than handing off to a
+separate workflow.
+
+For @-mentions to trigger the webhook, the bot needs to be **subscribed to
+the stream** where you're mentioning it - add it there in Zulip if mentions
+aren't triggering anything.
 
 ## Deploy
 
@@ -39,7 +47,8 @@ workflow.
    settings -> Bots -> Add a new bot), interface "Generic", endpoint URL =
    the `workers.dev` URL from step 3, and set the bot's token to the same
    string used for `ZULIP_WEBHOOK_TOKEN` above.
-5. DM the bot. You should get an instant "One sec..." reply, then the full
-   report as a follow-up DM a few seconds later.
+5. DM the bot `/reviews`, or @-mention it with `/reviews` in a stream it's
+   subscribed to. You should get an instant "One sec..." reply, then the
+   full report as a follow-up message a few seconds later.
 
 Debug with `npx wrangler tail` while sending a test DM.
