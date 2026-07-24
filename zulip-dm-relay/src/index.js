@@ -1,14 +1,17 @@
-// Relay: Zulip outgoing webhook (bot got a DM) -> GitHub repository_dispatch.
+// Zulip DM -> reviewer/PR report, entirely in one Worker.
 //
-// Zulip POSTs a JSON body here whenever the configured bot receives a
-// message. We check it's really from Zulip (shared token) and that it's a
-// direct message (not a stream mention - trigger "direct_message", Zulip's
-// current name for what used to be called "private_message"), then ask
-// GitHub to fire the "zulip-dm" repository_dispatch event, which the
-// repo-updates workflow listens for.
+// When the configured Zulip bot receives a direct message, this builds a
+// report of physlib's open PRs and reviewer load straight from the GitHub
+// API, then sends it back as a Zulip DM to whoever asked. No GitHub Actions
+// or repository_dispatch involved - this used to hand off to a workflow,
+// but since the Worker already has to talk to both APIs for the handshake,
+// it's simpler to just do the work here too.
+
+const GITHUB_API = "https://api.github.com";
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method !== "POST") {
       return new Response("Method not allowed", { status: 405 });
     }
@@ -32,34 +35,297 @@ export default {
       return jsonResponse({});
     }
 
-    const dispatchResp = await fetch(
-      `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/dispatches`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${env.GITHUB_TOKEN}`,
-          Accept: "application/vnd.github+json",
-          "X-GitHub-Api-Version": "2022-11-28",
-          "User-Agent": "zulip-dm-relay",
-        },
-        body: JSON.stringify({
-          event_type: "zulip-dm",
-          client_payload: { sender_id: payload.message?.sender_id },
-        }),
-      }
-    );
+    const senderId = payload.message?.sender_id;
 
-    if (!dispatchResp.ok) {
-      const errText = await dispatchResp.text();
-      console.error("GitHub dispatch failed", dispatchResp.status, errText);
-      return jsonResponse({
-        content: "Sorry, I couldn't trigger the report (GitHub API error).",
-      });
-    }
+    // Building the report makes several sequential GitHub API calls, which
+    // can take longer than Zulip's webhook timeout. Acknowledge immediately
+    // and do the real work in the background, delivering the result as a
+    // separate DM once it's ready.
+    ctx.waitUntil(buildAndSendReport(env, senderId));
 
-    return jsonResponse({ content: "Triggered the repo updates report." });
+    return jsonResponse({ content: "One sec, building the report..." });
   },
 };
+
+async function buildAndSendReport(env, senderId) {
+  try {
+    const report = await buildReport(env);
+    const message = formatMessage(report);
+    await postToZulip(env, senderId, message);
+  } catch (err) {
+    console.error("Failed to build/send report", err);
+    await postToZulip(
+      env,
+      senderId,
+      `Sorry, something went wrong generating the report: ${err.message}`
+    ).catch(() => {});
+  }
+}
+
+async function ghRequest(env, path, params) {
+  const url = new URL(`${GITHUB_API}${path}`);
+  for (const [k, v] of Object.entries(params || {})) {
+    url.searchParams.set(k, v);
+  }
+  const resp = await fetch(url, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      Authorization: `Bearer ${env.GH_TOKEN}`,
+      "User-Agent": "physlib-bots-relay",
+    },
+  });
+  if (!resp.ok) {
+    const detail = await resp.text();
+    throw new Error(`GitHub API error for ${url}: ${resp.status} ${detail}`);
+  }
+  const data = await resp.json();
+  return [data, resp.headers.get("Link") || ""];
+}
+
+async function ghPaginate(env, path, params = {}) {
+  let page = 1;
+  const results = [];
+  while (true) {
+    const [data, link] = await ghRequest(env, path, {
+      ...params,
+      per_page: 100,
+      page,
+    });
+    if (!data.length) break;
+    results.push(...data);
+    if (!link.includes('rel="next"')) break;
+    page++;
+  }
+  return results;
+}
+
+function fetchOpenPRs(env) {
+  return ghPaginate(env, `/repos/${env.TARGET_OWNER}/${env.TARGET_REPO}/pulls`, {
+    state: "open",
+    sort: "created",
+    direction: "desc",
+  });
+}
+
+async function fetchPRLinesChanged(env, number) {
+  const [data] = await ghRequest(
+    env,
+    `/repos/${env.TARGET_OWNER}/${env.TARGET_REPO}/pulls/${number}`
+  );
+  return (data.additions || 0) + (data.deletions || 0);
+}
+
+async function fetchRecentlyMergedPRs(env) {
+  const cutoff = Date.now() - DAY_MS;
+  const prs = await ghPaginate(env, `/repos/${env.TARGET_OWNER}/${env.TARGET_REPO}/pulls`, {
+    state: "closed",
+    sort: "updated",
+    direction: "desc",
+  });
+  return prs.filter((pr) => pr.merged_at && Date.parse(pr.merged_at) >= cutoff);
+}
+
+async function fetchRecentlyOpenedPRs(env) {
+  const cutoff = Date.now() - DAY_MS;
+  const prs = await ghPaginate(env, `/repos/${env.TARGET_OWNER}/${env.TARGET_REPO}/pulls`, {
+    state: "all",
+    sort: "created",
+    direction: "desc",
+  });
+  const opened = [];
+  for (const pr of prs) {
+    if (Date.parse(pr.created_at) < cutoff) break;
+    opened.push(pr);
+  }
+  return opened;
+}
+
+// Gets people who aren't assigned as a reviewer, but have pushed to the repo
+// in the past - needed to find people currently assigned to 0 reviews.
+async function fetchCollaborators(env) {
+  try {
+    const collabs = await ghPaginate(
+      env,
+      `/repos/${env.TARGET_OWNER}/${env.TARGET_REPO}/collaborators`,
+      { affiliation: "all" }
+    );
+    return collabs.map((c) => c.login);
+  } catch (err) {
+    console.error(
+      "Warning: could not list collaborators (needs push access on the repo). " +
+        "Roster will be built from requested reviewers only.",
+      err
+    );
+    return [];
+  }
+}
+
+async function buildReport(env) {
+  const busyThreshold = Number(env.BUSY_THRESHOLD || "3");
+  const maxPrsListed = Number(env.MAX_PRS_LISTED || "3");
+
+  const prs = await fetchOpenPRs(env);
+
+  const pendingCounts = {};
+  const pendingPRs = {}; // reviewer -> list of {number, title, url}
+  const unreviewedPRs = []; // open PRs with no reviewer assigned
+
+  for (const pr of prs) {
+    const reviewers = (pr.requested_reviewers || []).map((r) => r.login);
+
+    if (reviewers.length === 0) {
+      const labels = (pr.labels || []).map((l) => l.name);
+      const linesChanged = await fetchPRLinesChanged(env, pr.number);
+      unreviewedPRs.push({
+        number: pr.number,
+        title: pr.title,
+        url: pr.html_url,
+        labels,
+        linesChanged,
+      });
+    }
+    for (const login of reviewers) {
+      pendingCounts[login] = (pendingCounts[login] || 0) + 1;
+      (pendingPRs[login] ||= []).push({
+        number: pr.number,
+        title: pr.title,
+        url: pr.html_url,
+      });
+    }
+  }
+
+  const mergedRecently = await fetchRecentlyMergedPRs(env);
+  const openedRecently = await fetchRecentlyOpenedPRs(env);
+
+  const collaborators = await fetchCollaborators(env);
+  const roster = Array.from(
+    new Set([...collaborators, ...Object.keys(pendingCounts)])
+  ).sort();
+
+  const busy = [];
+  const moderate = [];
+  const quiet = [];
+  for (const login of roster) {
+    const count = pendingCounts[login] || 0;
+    if (count >= busyThreshold) busy.push([login, count]);
+    else if (count === 0) quiet.push([login, count]);
+    else moderate.push([login, count]);
+  }
+  busy.sort((a, b) => b[1] - a[1]);
+  moderate.sort((a, b) => b[1] - a[1]);
+  quiet.sort((a, b) => a[0].localeCompare(b[0]));
+
+  return {
+    busyThreshold,
+    maxPrsListed,
+    busy,
+    moderate,
+    quiet,
+    pendingPRs,
+    unreviewedPRs,
+    mergedRecently: mergedRecently.map((pr) => ({
+      number: pr.number,
+      title: pr.title,
+      url: pr.html_url,
+      author: pr.user.login,
+    })),
+    openedRecently: openedRecently.map((pr) => ({
+      number: pr.number,
+      title: pr.title,
+      url: pr.html_url,
+      author: pr.user.login,
+    })),
+  };
+}
+
+function formatMessage(report) {
+  const lines = [];
+  lines.push("Summary of PRs that need attention and available reviewers");
+  lines.push("");
+
+  const section = (title, entries, showPRs = false) => {
+    lines.push(`**${title}** (${entries.length})`);
+    if (entries.length === 0) {
+      lines.push("- _none_");
+    } else {
+      for (const [login, count] of entries) {
+        const suffix = count ? ` — ${count} pending review(s)` : "";
+        lines.push(`- @**${login}**${suffix}`);
+        if (showPRs) {
+          for (const pr of (report.pendingPRs[login] || []).slice(
+            0,
+            report.maxPrsListed
+          )) {
+            lines.push(`    - [#${pr.number} ${pr.title}](${pr.url})`);
+          }
+        }
+      }
+    }
+    lines.push("");
+  };
+
+  const unreviewed = report.unreviewedPRs;
+  lines.push(`**⚪ Open PRs with no reviewer assigned** (${unreviewed.length})`);
+  if (unreviewed.length === 0) lines.push("- _none_");
+  for (const pr of unreviewed) {
+    const tagStr = pr.labels.length
+      ? " " + pr.labels.map((l) => `\`${l}\``).join(" ")
+      : "";
+    lines.push(
+      `- [#${pr.number} ${pr.title}](${pr.url})${tagStr} — ${pr.linesChanged} lines changed`
+    );
+  }
+  lines.push("");
+
+  section(`🔴 Busy (≥${report.busyThreshold} pending reviews)`, report.busy, true);
+  section("🟡 Moderate", report.moderate);
+  section("🟢 Quiet (0 pending reviews)", report.quiet);
+
+  const opened = report.openedRecently;
+  lines.push(`**🟤 Opened in the last 24h** (${opened.length})`);
+  if (opened.length === 0) lines.push("- _none_");
+  for (const pr of opened) {
+    lines.push(`- [#${pr.number} ${pr.title}](${pr.url}) by @**${pr.author}**`);
+  }
+  lines.push("");
+
+  const merged = report.mergedRecently;
+  lines.push(`**✅ Merged in the last 24h** (${merged.length})`);
+  if (merged.length === 0) lines.push("- _none_");
+  for (const pr of merged) {
+    lines.push(`- [#${pr.number} ${pr.title}](${pr.url}) by @**${pr.author}**`);
+  }
+  lines.push("");
+
+  return lines.join("\n");
+}
+
+async function postToZulip(env, senderId, content) {
+  const body = new URLSearchParams({
+    type: "direct",
+    to: JSON.stringify([senderId]),
+    content,
+  });
+
+  const credentials = btoa(`${env.ZULIP_BOT_EMAIL}:${env.ZULIP_BOT_API_KEY}`);
+
+  const resp = await fetch(`${env.ZULIP_SITE.replace(/\/$/, "")}/api/v1/messages`, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${credentials}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body,
+  });
+
+  const text = await resp.text();
+  if (!resp.ok) {
+    console.error("Zulip API error", resp.status, text);
+    throw new Error(`Zulip API error: ${resp.status} ${text}`);
+  }
+  console.log("Zulip response:", text);
+}
 
 function jsonResponse(body) {
   return new Response(JSON.stringify(body), {

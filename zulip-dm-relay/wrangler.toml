@@ -4,8 +4,11 @@ compatibility_date = "2026-07-23"
 
 # Not secret - fine as plain vars.
 [vars]
-GITHUB_OWNER = "Alex-Zughaid"
-GITHUB_REPO = "PhysLibBots"
+TARGET_OWNER = "Alex-Zughaid"
+TARGET_REPO = "physlib"
+BUSY_THRESHOLD = "3"
+MAX_PRS_LISTED = "3"
 
-# Secrets (ZULIP_WEBHOOK_TOKEN, GITHUB_TOKEN) are NOT set here.
-# You'll add them with `wrangler secret put` (see instructions).
+# Secrets (ZULIP_WEBHOOK_TOKEN, GH_TOKEN, ZULIP_SITE, ZULIP_BOT_EMAIL,
+# ZULIP_BOT_API_KEY) are NOT set here. You'll add them with
+# `wrangler secret put` (see instructions).
