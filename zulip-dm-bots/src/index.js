@@ -99,10 +99,15 @@ async function sendReviewReport(env, destination) {
 }
 
 const REPORT_CACHE_SECONDS = 300;
+// Bump this when the report's JSON shape changes, so old cached entries
+// don't linger for up to REPORT_CACHE_SECONDS serving a stale shape.
+const REPORT_VERSION = "v2";
 
 async function handleReportApi(env, ctx) {
   const cache = caches.default;
-  const cacheKey = new Request("https://zulip-dm-relay.internal/report");
+  const cacheKey = new Request(
+    `https://zulip-dm-relay.internal/report/${REPORT_VERSION}`
+  );
 
   const cached = await cache.match(cacheKey);
   if (cached) return cached;
@@ -122,6 +127,9 @@ async function handleReportApi(env, ctx) {
     headers: {
       "Content-Type": "application/json",
       "Cache-Control": `public, max-age=${REPORT_CACHE_SECONDS}`,
+      // Fetched client-side (browser) from the physlib website, which is a
+      // different origin - this is public, read-only data, so open CORS.
+      "Access-Control-Allow-Origin": "*",
     },
   });
 
@@ -317,6 +325,19 @@ async function buildReport(env) {
     quiet,
     pendingPRs,
     unreviewedPRs,
+    // Full open-PR list (already fetched above for the unreviewed-PR pass) -
+    // exposed as-is so consumers like the physlib website can build their
+    // own PR listings/categorizations from one shared data source instead
+    // of each making a separate GitHub API call.
+    openPRs: prs.map((pr) => ({
+      number: pr.number,
+      title: pr.title,
+      html_url: pr.html_url,
+      draft: pr.draft,
+      created_at: pr.created_at,
+      user: pr.user ? { login: pr.user.login } : null,
+      labels: (pr.labels || []).map((l) => ({ name: l.name, color: l.color })),
+    })),
     mergedRecently: mergedRecently.map((pr) => ({
       number: pr.number,
       title: pr.title,
