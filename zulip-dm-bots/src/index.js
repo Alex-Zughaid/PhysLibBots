@@ -38,12 +38,18 @@ export default {
 
     // Only handle DMs and stream @-mentions - ignore anything else.
     if (payload.trigger !== "direct_message" && payload.trigger !== "mention") {
+      console.log("Ignoring trigger:", payload.trigger);
       return jsonResponse({});
     }
 
-    const command = (payload.data || "").trim();
+    // For stream mentions Zulip may or may not strip the @**BotName** prefix
+    // from payload.data depending on the server version. Strip it defensively.
+    const rawData = (payload.data || "").trim();
+    const command = rawData.replace(/^@\*\*[^*]+\*\*\s*/, "").trim();
+    console.log("trigger:", payload.trigger, "raw data:", rawData, "command:", command);
     const handler = COMMANDS[command];
     if (!handler) {
+      console.log("Unknown command:", command);
       return jsonResponse({});
     }
 
