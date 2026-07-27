@@ -1,17 +1,4 @@
-// Zulip bot commands, entirely in one Worker.
-//
-// Triggered either by DMing the bot, or by @-mentioning it in a stream
-// thread. In both cases Zulip's `data` field gives us the message content
-// with the bot's own mention stripped out, so we can treat "/reviews" the
-// same way regardless of where it came from. Replies go back as a DM for
-// the DM case, or into the same stream/topic for the mention case.
-//
-// Commands are a small lookup table (see COMMANDS below) so more can be
-// added later without restructuring the dispatch logic.
-//
-// No GitHub Actions or repository_dispatch involved - this used to hand
-// off to a workflow, but since the Worker already has to talk to both
-// APIs for the handshake, it's simpler to just do the work here too.
+// Script to get the repo updates, triggered by a Zulip DM
 
 const GITHUB_API = "https://api.github.com";
 const DAY_MS = 24 * 60 * 60 * 1000;
