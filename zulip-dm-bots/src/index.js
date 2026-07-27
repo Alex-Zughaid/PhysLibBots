@@ -49,7 +49,14 @@ export default {
 
     const destination =
       payload.trigger === "direct_message"
-        ? { type: "direct", userId: payload.message?.sender_id }
+        ? {
+            type: "direct",
+            // For group DMs, display_recipient is an array of {id, ...} objects.
+            // Reply to all participants so the response goes to the whole group.
+            userIds: Array.isArray(payload.message?.display_recipient)
+              ? payload.message.display_recipient.map((u) => u.id)
+              : [payload.message?.sender_id],
+          }
         : {
             type: "stream",
             streamId: payload.message?.stream_id,
@@ -384,7 +391,7 @@ function formatMessage(report) {
 async function postToZulip(env, destination, content) {
   const params =
     destination.type === "direct"
-      ? { type: "direct", to: JSON.stringify([destination.userId]), content }
+      ? { type: "direct", to: JSON.stringify(destination.userIds), content }
       : {
           type: "stream",
           to: String(destination.streamId),
