@@ -9,6 +9,15 @@ const COMMANDS = {
 
 export default {
   async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // Public read-only JSON version of the same report the /reviews command
+    // sends over Zulip - lets other things (e.g. the physlib website) reuse
+    // this exact computation instead of re-implementing it elsewhere.
+    if (request.method === "GET" && url.pathname === "/report") {
+      return handleReportApi(env, ctx);
+    }
+
     if (request.method !== "POST") {
       return new Response("Method not allowed", { status: 405 });
     }
@@ -74,6 +83,37 @@ async function sendReviewReport(env, destination) {
   const report = await buildReport(env);
   const message = formatMessage(report);
   await postToZulip(env, destination, message);
+}
+
+const REPORT_CACHE_SECONDS = 300;
+
+async function handleReportApi(env, ctx) {
+  const cache = caches.default;
+  const cacheKey = new Request("https://zulip-dm-relay.internal/report");
+
+  const cached = await cache.match(cacheKey);
+  if (cached) return cached;
+
+  let report;
+  try {
+    report = await buildReport(env);
+  } catch (err) {
+    console.error("Failed to build report for /report", err);
+    return new Response(JSON.stringify({ error: err.message }), {
+      status: 502,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const response = new Response(JSON.stringify(report), {
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": `public, max-age=${REPORT_CACHE_SECONDS}`,
+    },
+  });
+
+  ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  return response;
 }
 
 async function ghRequest(env, path, params) {
