@@ -266,16 +266,36 @@ async function buildReport(env) {
   const busyThreshold = Number(env.BUSY_THRESHOLD || "3");
   const maxPrsListed = Number(env.MAX_PRS_LISTED || "3");
 
-  const prs = await fetchOpenPRs(env);
+  // Fetch open PRs and PRs awaiting author in parallel.
+  const [prs, awaitingAuthorRaw] = await Promise.all([
+    fetchOpenPRs(env),
+    ghSearchIssues(
+      env,
+      `repo:${env.TARGET_OWNER}/${env.TARGET_REPO} is:pr is:open review:changes_requested`
+    ),
+  ]);
+
+  const awaitingAuthorNumbers = new Set(awaitingAuthorRaw.map((pr) => pr.number));
+  const awaitingAuthorPRs = (
+    await Promise.all(
+      awaitingAuthorRaw.map(async (pr) => ({
+        number: pr.number,
+        title: pr.title,
+        url: pr.html_url,
+        labels: (pr.labels || []).map((l) => l.name),
+        linesChanged: await fetchPRLinesChanged(env, pr.number),
+      }))
+    )
+  ).sort((a, b) => a.linesChanged - b.linesChanged);
 
   const pendingCounts = {};
   const pendingPRs = {}; // reviewer -> list of {number, title, url}
-  const unreviewedPRs = []; // open PRs with no reviewer assigned
+  const unreviewedPRs = []; // open PRs with no reviewer assigned and no changes requested
 
   for (const pr of prs) {
     const reviewers = (pr.requested_reviewers || []).map((r) => r.login);
 
-    if (reviewers.length === 0) {
+    if (reviewers.length === 0 && !awaitingAuthorNumbers.has(pr.number)) {
       const labels = (pr.labels || []).map((l) => l.name);
       const linesChanged = await fetchPRLinesChanged(env, pr.number);
       unreviewedPRs.push({
@@ -295,6 +315,8 @@ async function buildReport(env) {
       });
     }
   }
+
+  unreviewedPRs.sort((a, b) => a.linesChanged - b.linesChanged);
 
   const mergedRecently = await fetchRecentlyMergedPRs(env);
   const openedRecently = await fetchRecentlyOpenedPRs(env);
@@ -324,6 +346,7 @@ async function buildReport(env) {
     moderate,
     quiet,
     pendingPRs,
+    awaitingAuthorPRs,
     unreviewedPRs,
     // Full open-PR list (already fetched above for the unreviewed-PR pass) -
     // exposed as-is so consumers like the physlib website can build their
@@ -379,17 +402,29 @@ function formatMessage(report) {
     lines.push("");
   };
 
+  const prTable = (prs) => {
+    if (prs.length === 0) return ["- _none_"];
+    // Blank line before the table is required for Zulip's parser to recognise it.
+    // Spaces around --- in the separator row improve compatibility.
+    const rows = ["", "| PR | Labels | Lines changed |", "| --- | --- | --- |"];
+    for (const pr of prs) {
+      const title = pr.title.replace(/\|/g, "\\|");
+      const labels = pr.labels.length
+        ? pr.labels.map((l) => `\`${l}\``).join(" ")
+        : "—";
+      rows.push(`| [#${pr.number} ${title}](${pr.url}) | ${labels} | ${pr.linesChanged} |`);
+    }
+    return rows;
+  };
+
+  const awaitingAuthor = report.awaitingAuthorPRs;
+  lines.push(`**⭕️ Awaiting author** (${awaitingAuthor.length})`);
+  lines.push(...prTable(awaitingAuthor));
+  lines.push("");
+
   const unreviewed = report.unreviewedPRs;
-  lines.push(`**⚪ Open PRs with no reviewer assigned** (${unreviewed.length})`);
-  if (unreviewed.length === 0) lines.push("- _none_");
-  for (const pr of unreviewed) {
-    const tagStr = pr.labels.length
-      ? " " + pr.labels.map((l) => `\`${l}\``).join(" ")
-      : "";
-    lines.push(
-      `- [#${pr.number} ${pr.title}](${pr.url})${tagStr} — ${pr.linesChanged} lines changed`
-    );
-  }
+  lines.push(`**⚪ Needs reviewer** (${unreviewed.length})`);
+  lines.push(...prTable(unreviewed));
   lines.push("");
 
   section(`🔴 Busy (≥${report.busyThreshold} pending reviews)`, report.busy, true);
