@@ -101,7 +101,7 @@ async function sendReviewReport(env, destination) {
 const REPORT_CACHE_SECONDS = 300;
 // Bump this when the report's JSON shape changes, so old cached entries
 // don't linger for up to REPORT_CACHE_SECONDS serving a stale shape.
-const REPORT_VERSION = "v2";
+const REPORT_VERSION = "v3";
 
 async function handleReportApi(env, ctx) {
   const cache = caches.default;
@@ -224,22 +224,31 @@ async function ghSearchIssues(env, query) {
   return results;
 }
 
-function isoCutoff() {
-  return new Date(Date.now() - DAY_MS).toISOString().slice(0, 19);
+function isoCutoff(days = 1) {
+  return new Date(Date.now() - days * DAY_MS).toISOString().slice(0, 19);
 }
 
-function fetchRecentlyMergedPRs(env) {
+function fetchRecentlyMergedPRs(env, days = 1) {
   return ghSearchIssues(
     env,
-    `repo:${env.TARGET_OWNER}/${env.TARGET_REPO} is:pr is:merged merged:>=${isoCutoff()}`
+    `repo:${env.TARGET_OWNER}/${env.TARGET_REPO} is:pr is:merged merged:>=${isoCutoff(days)}`
   );
 }
 
-function fetchRecentlyOpenedPRs(env) {
+function fetchRecentlyOpenedPRs(env, days = 1) {
   return ghSearchIssues(
     env,
-    `repo:${env.TARGET_OWNER}/${env.TARGET_REPO} is:pr created:>=${isoCutoff()}`
+    `repo:${env.TARGET_OWNER}/${env.TARGET_REPO} is:pr created:>=${isoCutoff(days)}`
   );
+}
+
+function mapRecentPRs(prs) {
+  return prs.map((pr) => ({
+    number: pr.number,
+    title: pr.title,
+    url: pr.html_url,
+    author: pr.user.login,
+  }));
 }
 
 // Gets people who aren't assigned as a reviewer, but have pushed to the repo
@@ -318,8 +327,35 @@ async function buildReport(env) {
 
   unreviewedPRs.sort((a, b) => a.linesChanged - b.linesChanged);
 
+  const cutoff = new Date(Date.now() - DAY_MS).toISOString();
+  const recentlyUpdatedPRs = prs
+    .filter((pr) => pr.updated_at >= cutoff)
+    .sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at))
+    .map((pr) => ({
+      number: pr.number,
+      title: pr.title,
+      url: pr.html_url,
+      author: pr.user?.login,
+      updatedAt: pr.updated_at,
+    }));
+
   const mergedRecently = await fetchRecentlyMergedPRs(env);
   const openedRecently = await fetchRecentlyOpenedPRs(env);
+
+  // Wider activity windows for the website's summary - the Zulip message
+  // only ever shows the 24h numbers above, so these are additive rather
+  // than replacing anything formatMessage() reads.
+  const [
+    mergedLast7d,
+    openedLast7d,
+    mergedLast30d,
+    openedLast30d,
+  ] = await Promise.all([
+    fetchRecentlyMergedPRs(env, 7),
+    fetchRecentlyOpenedPRs(env, 7),
+    fetchRecentlyMergedPRs(env, 30),
+    fetchRecentlyOpenedPRs(env, 30),
+  ]);
 
   const collaborators = await fetchCollaborators(env);
   const roster = Array.from(
@@ -348,6 +384,7 @@ async function buildReport(env) {
     pendingPRs,
     awaitingAuthorPRs,
     unreviewedPRs,
+    recentlyUpdatedPRs,
     // Full open-PR list (already fetched above for the unreviewed-PR pass) -
     // exposed as-is so consumers like the physlib website can build their
     // own PR listings/categorizations from one shared data source instead
@@ -361,18 +398,12 @@ async function buildReport(env) {
       user: pr.user ? { login: pr.user.login } : null,
       labels: (pr.labels || []).map((l) => ({ name: l.name, color: l.color })),
     })),
-    mergedRecently: mergedRecently.map((pr) => ({
-      number: pr.number,
-      title: pr.title,
-      url: pr.html_url,
-      author: pr.user.login,
-    })),
-    openedRecently: openedRecently.map((pr) => ({
-      number: pr.number,
-      title: pr.title,
-      url: pr.html_url,
-      author: pr.user.login,
-    })),
+    mergedRecently: mapRecentPRs(mergedRecently),
+    openedRecently: mapRecentPRs(openedRecently),
+    mergedLast7d: mapRecentPRs(mergedLast7d),
+    openedLast7d: mapRecentPRs(openedLast7d),
+    mergedLast30d: mapRecentPRs(mergedLast30d),
+    openedLast30d: mapRecentPRs(openedLast30d),
   };
 }
 
@@ -447,6 +478,14 @@ function formatMessage(report) {
   }
   lines.push("");
 
+  const updated = report.recentlyUpdatedPRs;
+  lines.push(`**🔄 Recently modified (last 24h)** (${updated.length})`);
+  if (updated.length === 0) lines.push("- _none_");
+  for (const pr of updated) {
+    lines.push(`- [#${pr.number} ${pr.title}](${pr.url}) by @**${pr.author}** — ${relativeTime(pr.updatedAt)}`);
+  }
+  lines.push("");
+
   return lines.join("\n");
 }
 
@@ -479,6 +518,14 @@ async function postToZulip(env, destination, content) {
     throw new Error(`Zulip API error: ${resp.status} ${text}`);
   }
   console.log("Zulip response:", text);
+}
+
+function relativeTime(isoString) {
+  const diffMs = Date.now() - new Date(isoString).getTime();
+  const hours = Math.floor(diffMs / (60 * 60 * 1000));
+  const minutes = Math.floor(diffMs / (60 * 1000));
+  if (hours >= 1) return `${hours}h ago`;
+  return `${minutes}m ago`;
 }
 
 function jsonResponse(body) {
