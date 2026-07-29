@@ -101,7 +101,7 @@ async function sendReviewReport(env, destination) {
 const REPORT_CACHE_SECONDS = 300;
 // Bump this when the report's JSON shape changes, so old cached entries
 // don't linger for up to REPORT_CACHE_SECONDS serving a stale shape.
-const REPORT_VERSION = "v3";
+const REPORT_VERSION = "v4";
 
 async function handleReportApi(env, ctx) {
   const cache = caches.default;
@@ -276,13 +276,31 @@ async function buildReport(env) {
   const maxPrsListed = Number(env.MAX_PRS_LISTED || "3");
 
   // Fetch open PRs and PRs awaiting author in parallel.
-  const [prs, awaitingAuthorRaw] = await Promise.all([
+  // A PR counts as "awaiting author" if it has a changes-requested review OR
+  // carries the "awaiting-author" label (some repos use labels instead of / in
+  // addition to formal review states).
+  const awaitingAuthorLabel = env.AWAITING_AUTHOR_LABEL || "awaiting-author";
+  const [prs, awaitingByReview, awaitingByLabel] = await Promise.all([
     fetchOpenPRs(env),
     ghSearchIssues(
       env,
-      `repo:${env.TARGET_OWNER}/${env.TARGET_REPO} is:pr is:open review:changes_requested`
+      `repo:${env.TARGET_OWNER}/${env.TARGET_REPO} is:pr is:open draft:false review:changes_requested -label:"ready-to-merge" -label:"reviewer-approved"`
+    ),
+    ghSearchIssues(
+      env,
+      `repo:${env.TARGET_OWNER}/${env.TARGET_REPO} is:pr is:open draft:false label:"${awaitingAuthorLabel}"`
     ),
   ]);
+
+  // Exclude drafts from the open PRs list (used for unreviewed, reviewer counts, recently updated).
+  const nonDraftPrs = prs.filter((pr) => !pr.draft);
+
+  // Merge and deduplicate by PR number.
+  const awaitingAuthorByNumber = new Map();
+  for (const pr of [...awaitingByReview, ...awaitingByLabel]) {
+    awaitingAuthorByNumber.set(pr.number, pr);
+  }
+  const awaitingAuthorRaw = [...awaitingAuthorByNumber.values()];
 
   const awaitingAuthorNumbers = new Set(awaitingAuthorRaw.map((pr) => pr.number));
   const awaitingAuthorPRs = (
@@ -301,7 +319,7 @@ async function buildReport(env) {
   const pendingPRs = {}; // reviewer -> list of {number, title, url}
   const unreviewedPRs = []; // open PRs with no reviewer assigned and no changes requested
 
-  for (const pr of prs) {
+  for (const pr of nonDraftPrs) {
     const reviewers = (pr.requested_reviewers || []).map((r) => r.login);
 
     if (reviewers.length === 0 && !awaitingAuthorNumbers.has(pr.number)) {
@@ -328,7 +346,7 @@ async function buildReport(env) {
   unreviewedPRs.sort((a, b) => a.linesChanged - b.linesChanged);
 
   const cutoff = new Date(Date.now() - DAY_MS).toISOString();
-  const recentlyUpdatedPRs = prs
+  const recentlyUpdatedPRs = nonDraftPrs
     .filter((pr) => pr.updated_at >= cutoff)
     .sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at))
     .map((pr) => ({
